@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"slices"
 
 	"github.com/cenkalti/backoff"
 	"github.com/miekg/dns"
@@ -27,6 +28,10 @@ const (
 	IPv6        = 0x02
 	IPv4AndIPv6 = (IPv4 | IPv6) //< Default option.
 )
+
+// cleanupFreq is how often the browse loop sweeps for entries whose TTL
+// has lapsed without a refresh.
+const cleanupFreq = 10 * time.Minute
 
 type clientOpts struct {
 	listenOn IPType
@@ -79,6 +84,56 @@ func NewResolver(options ...ClientOption) (*Resolver, error) {
 	return &Resolver{
 		c: c,
 	}, nil
+}
+
+// sendRemoval notifies the subscriber that an instance is gone by
+// delivering a copy of the entry with TTL zeroed — the removal signal.
+func sendRemoval(params *lookupParams, e *ServiceEntry) {
+	rm := *e
+	rm.TTL = 0
+	params.Entries <- &rm
+}
+
+// sameEntry reports whether two resolutions of the same instance carry
+// identical connection data. When they differ (e.g. a new IP), the browse loop
+// re-delivers the entry as an update.
+func sameEntry(a, b *ServiceEntry) bool {
+	return a.Port == b.Port &&
+		a.HostName == b.HostName &&
+		sameIPs(a.AddrIPv4, b.AddrIPv4) &&
+		sameIPs(a.AddrIPv6, b.AddrIPv6) &&
+		sameStrs(a.Text, b.Text)
+}
+
+// sameIPs reports whether two slices of IP addresses contain the same
+// set of addresses, regardless of order.
+func sameIPs(a, b []net.IP) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, x := range a {
+		if !slices.ContainsFunc(b, x.Equal) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameStrs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, s := range a {
+		counts[s]++
+	}
+	for _, s := range b {
+		counts[s]--
+		if counts[s] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Browse for all services of a given type in a given domain.
@@ -193,6 +248,11 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 	// Iterate through channels from listeners goroutines
 	var entries, sentEntries map[string]*ServiceEntry
 	sentEntries = make(map[string]*ServiceEntry)
+	// Track per-entry expiry so departures with no goodbye packet are
+	// swept on a timer (RFC 6762 §10), not left in the cache forever.
+	expiry := make(map[string]time.Time)
+	ticker := time.NewTicker(cleanupFreq)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -200,6 +260,18 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 			params.done()
 			c.shutdown()
 			return
+		case <-ticker.C:
+			// Expire entries whose TTL lapsed without a refresh and notify
+			// the subscriber of the removal.
+			now := time.Now()
+			for k, e := range sentEntries {
+				if exp, ok := expiry[k]; ok && now.After(exp) {
+					sendRemoval(params, e)
+					delete(sentEntries, k)
+					delete(expiry, k)
+				}
+			}
+			continue
 		case msg := <-msgCh:
 			entries = make(map[string]*ServiceEntry)
 			sections := append(msg.Answer, msg.Ns...)
@@ -272,13 +344,15 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 		}
 
 		if len(entries) > 0 {
+			now := time.Now()
 			for k, e := range entries {
 				if e.TTL == 0 {
-					delete(entries, k)
-					delete(sentEntries, k)
-					continue
-				}
-				if _, ok := sentEntries[k]; ok {
+					// Goodbye packet so the subscriber learns the responder left.
+					if prev, ok := sentEntries[k]; ok {
+						sendRemoval(params, prev)
+						delete(sentEntries, k)
+						delete(expiry, k)
+					}
 					continue
 				}
 
@@ -291,9 +365,14 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 						continue
 					}
 				}
-				// Submit entry to subscriber and cache it.
-				// This is also a point to possibly stop probing actively for a
-				// service entry.
+
+				// Refresh the TTL, then deliver on first sight OR on change.
+				// Re-delivering when the address/port/txt differs is what surfaces an
+				// IP-address change (RFC 6762 §8.4 / §10.2).
+				expiry[k] = now.Add(time.Duration(e.TTL) * time.Second)
+				if prev, ok := sentEntries[k]; ok && sameEntry(prev, e) {
+					continue
+				}
 				params.Entries <- e
 				sentEntries[k] = e
 				if !params.isBrowsing {
@@ -373,8 +452,12 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 func (c *client) periodicQuery(ctx context.Context, params *lookupParams) error {
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = 4 * time.Second
-	bo.MaxInterval = 60 * time.Second
 	bo.MaxElapsedTime = 0
+	// Custom intervals to conform to RFC 6762 §8.1.2
+	// The backoff multiplier needs to be 2.
+	// We are allowed up to 60 mins of backoff, and here we selected max 30 mins.
+	bo.Multiplier = 2
+	bo.MaxInterval = 30 * time.Minute
 	bo.Reset()
 
 	var timer *time.Timer
